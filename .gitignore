@@ -11,3 +11,10 @@ cabal-dev
 .project
 .hpc
 *.tix
+/.cabal-sandbox/
+/cabal.sandbox.config
+/distributed-process/
+/distributed-static/
+/network-transport-tcp/
+/network-transport/
+/rank1dynamic/
