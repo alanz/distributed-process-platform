@@ -8,21 +8,16 @@ module Main where
 import Control.Concurrent.MVar
 import Control.Exception (SomeException)
 import Control.Distributed.Process hiding (call)
-import Control.Distributed.Process.Closure
 import Control.Distributed.Process.Node
 import Control.Distributed.Process.Platform hiding (__remoteTable, monitor, send, nsend)
-import Control.Distributed.Process.Platform.Async
 import Control.Distributed.Process.Platform.ManagedProcess
 import Control.Distributed.Process.Platform.Test
 import Control.Distributed.Process.Platform.Time
-import Control.Distributed.Process.Platform.Timer
 import Control.Distributed.Process.Serializable()
 
 import MathsDemo
 import Counter
 import qualified SafeCounter as SafeCounter
-import SimplePool hiding (start)
-import qualified SimplePool as Pool (start)
 
 #if ! MIN_VERSION_base(4,6,0)
 import Prelude hiding (catch)
@@ -71,18 +66,6 @@ explodingServer pid =
               (\(e :: SomeException) -> stash exitReason $ ExitOther (show e))
     return (spid, exitReason)
 
-sampleTask :: (TimeInterval, String) -> Process String
-sampleTask (t, s) = sleep t >> return s
-
-namedTask :: (String, String) -> Process String
-namedTask (name, result) = do
-  self <- getSelfPid
-  register name self
-  () <- expect
-  return result
-
-$(remotable ['sampleTask, 'namedTask])
-
 testCallReturnTypeMismatchHandling :: TestResult Bool -> Process ()
 testCallReturnTypeMismatchHandling result =
   let procDef = statelessProcess {
@@ -110,58 +93,13 @@ testChannelBasedService result =
     stash result (echo == "hello")
     kill pid "done"
 
--- SimplePool tests
-
-startPool :: PoolSize -> Process ProcessId
-startPool sz = spawnLocal $ do
-  Pool.start (pool sz :: Process (InitResult (Pool String)))
-
-testSimplePoolJobBlocksCaller :: TestResult (AsyncResult (Either String String))
-                              -> Process ()
-testSimplePoolJobBlocksCaller result = do
-  pid <- startPool 1
-  -- we do a non-blocking test first
-  job <- return $ ($(mkClosure 'sampleTask) (seconds 2, "foobar"))
-  callAsync pid job >>= wait >>= stash result
-
-testJobQueueSizeLimiting ::
-    TestResult (Maybe (AsyncResult (Either String String)),
-                Maybe (AsyncResult (Either String String)))
-                         -> Process ()
-testJobQueueSizeLimiting result = do
-  pid <- startPool 1
-  job1 <- return $ ($(mkClosure 'namedTask) ("job1", "foo"))
-  job2 <- return $ ($(mkClosure 'namedTask) ("job2", "bar"))
-  h1 <- callAsync pid job1 :: Process (Async (Either String String))
-  h2 <- callAsync pid job2 :: Process (Async (Either String String))
-
-  -- despite the fact that we tell job2 to proceed first,
-  -- the size limit (of 1) will ensure that only job1 can
-  -- proceed successfully!
-  nsend "job2" ()
-  AsyncPending <- poll h2
-  Nothing <- whereis "job2"
-
-  -- we can get here *very* fast, so give the registration time to kick in
-  sleep $ milliSeconds 250
-  j1p <- whereis "job1"
-  case j1p of
-    Nothing -> die $ "timing is out - job1 isn't registered yet"
-    Just p  -> send p ()
-
-  -- once job1 completes, we *should* be able to proceed with job2
-  -- but we allow a little time for things to catch up
-  sleep $ milliSeconds 250
-  nsend "job2" ()
-
-  r2 <- waitTimeout (within 2 Seconds) h2
-  r1 <- waitTimeout (within 2 Seconds) h1
-  stash result (r1, r2)
-
 -- MathDemo tests
 
 testAdd :: ProcessId -> TestResult Double -> Process ()
 testAdd pid result = add pid 10 10 >>= stash result
+
+testBadAdd :: ProcessId -> TestResult (Either ExitReason Int) -> Process ()
+testBadAdd pid result = safeCall pid (Add 10 10) >>= stash result
 
 testDivByZero :: ProcessId -> TestResult (Either DivByZero Double) -> Process ()
 testDivByZero pid result = divide pid 125 0 >>= stash result
@@ -213,12 +151,9 @@ testCounterExceedsLimit result = do
     ]
   stash result (r /= DiedNormal)
 
-myRemoteTable :: RemoteTable
-myRemoteTable = Main.__remoteTable initRemoteTable
-
 tests :: NT.Transport  -> IO [Test]
 tests transport = do
-  localNode <- newLocalNode transport myRemoteTable
+  localNode <- newLocalNode transport initRemoteTable
   mpid <- newEmptyMVar
   _ <- forkProcess localNode $ launchMathServer >>= stash mpid
   pid <- takeMVar mpid
@@ -314,18 +249,6 @@ tests transport = do
             (delayedAssertion "expected handler to catch exception and continue"
              localNode Nothing (testUnsafeAlternativeErrorHandling $ explodingServer))
           ]
-        , testGroup "simple pool examples" [
-            testCase "each task execution blocks the caller"
-              (delayedAssertion
-               "expected the server to return the task outcome"
-               localNode (AsyncDone (Right "foobar")) testSimplePoolJobBlocksCaller)
-          , testCase "only 'max' tasks can proceed at any time"
-              (delayedAssertion
-               "expected the server to block the second job until the first was released"
-               localNode
-               (Just (AsyncDone (Right "foo")),
-                Just (AsyncDone (Right "bar"))) testJobQueueSizeLimiting)
-          ]
         , testGroup "math server examples" [
             testCase "error (Left) returned from x / 0"
               (delayedAssertion
@@ -335,6 +258,12 @@ tests transport = do
               (delayedAssertion
                "expected the server to return DivByZero"
                localNode 20 (testAdd pid))
+          , testCase "10 + 10 does not evaluate to 10 :: Int at all!"
+            (delayedAssertion
+             "expected the server to return ExitOther..."
+             localNode
+             (Left $ ExitOther $ "DiedException \"exit-from=" ++ (show pid) ++ "\"")
+             (testBadAdd pid))
           ]
         , testGroup "counter server examples" [
             testCase "initial counter state = 5"

@@ -50,24 +50,33 @@ various flavours of @catchExit@ primitive from distributed-process.
 module Control.Distributed.Process.Platform
   (
     -- * Exported Types
-    Addressable(..)
+    Addressable
+  , Resolvable(..)
+  , Routable(..)
+  , Linkable(..)
+  , Killable(..)
   , NFSerializable
   , Recipient(..)
   , ExitReason(..)
+  , Channel
   , Tag
   , TagPool
 
     -- * Primitives overriding those in distributed-process
-  , module Control.Distributed.Process.Platform.UnsafePrimitives
   , monitor
+  , module Control.Distributed.Process.Platform.UnsafePrimitives
 
     -- * Utilities and Extended Primitives
+  , spawnSignalled
   , spawnLinkLocal
   , spawnMonitorLocal
   , linkOnFailure
   , times
   , isProcessAlive
   , matchCond
+  , deliver
+  , awaitExit
+  , awaitResponse
 
     -- * Call/Tagging support
   , newTagPool
@@ -88,6 +97,7 @@ import Control.Distributed.Process.Platform.Internal.Types
   , ExitReason(..)
   , Tag
   , TagPool
+  , Channel
   , newTagPool
   , getTag
   )
@@ -95,10 +105,13 @@ import Control.Distributed.Process.Platform.UnsafePrimitives
 import Control.Distributed.Process.Platform.Internal.Primitives hiding (__remoteTable)
 import qualified Control.Distributed.Process.Platform.Internal.Primitives (__remoteTable)
 import qualified Control.Distributed.Process.Platform.Internal.Types      (__remoteTable)
+import qualified Control.Distributed.Process.Platform.Execution.Mailbox (__remoteTable)
 
 -- remote table
 
 __remoteTable :: RemoteTable -> RemoteTable
 __remoteTable =
-   Control.Distributed.Process.Platform.Internal.Primitives.__remoteTable .
-   Control.Distributed.Process.Platform.Internal.Types.__remoteTable
+  Control.Distributed.Process.Platform.Execution.Mailbox.__remoteTable .
+  Control.Distributed.Process.Platform.Internal.Primitives.__remoteTable .
+  Control.Distributed.Process.Platform.Internal.Types.__remoteTable
+

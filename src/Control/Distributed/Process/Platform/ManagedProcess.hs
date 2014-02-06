@@ -2,6 +2,7 @@
 {-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE RecordWildCards            #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -27,25 +28,22 @@
 -- Once started, a /managed process/ will consume messages from its mailbox and
 -- pass them on to user defined /handlers/ based on the types received (mapped
 -- to those accepted by the handlers) and optionally by also evaluating user
--- supplied predicates to determine which handlers are valid.
+-- supplied predicates to determine which handler(s) should run.
 -- Each handler returns a 'ProcessAction' which specifies how we should proceed.
 -- If none of the handlers is able to process a message (because their types are
--- incompatible) then an 'unhandledMessagePolicy' will be applied.
+-- incompatible), then the 'unhandledMessagePolicy' will be applied.
 --
--- The 'ProcessAction' type defines the ways in which a /managed process/ responds
--- to its inputs, either by continuing to read incoming messages, setting an
--- optional timeout, sleeping for a while or by stopping. The optional timeout
+-- The 'ProcessAction' type defines the ways in which our process can respond
+-- to its inputs, whether by continuing to read incoming messages, setting an
+-- optional timeout, sleeping for a while or stopping. The optional timeout
 -- behaves a little differently to the other process actions. If no messages
 -- are received within the specified time span, a user defined 'timeoutHandler'
 -- will be called in order to determine the next action.
 --
--- Generic processes are defined by the 'ProcessDefinition' type, using record
--- syntax. The 'ProcessDefinition' fields contain handlers (or lists of them)
--- for specific tasks, such as the @timeoutHandler@, and a @terminateHandler@
--- which is called just before the process exits. This handler will be called
--- /whenever/ the process is stopping, i.e., when a callback returns 'stop' as
--- the next action /or/ if an unhandled exit signal or similar asynchronous
--- exception is thrown in (or to) the process itself.
+-- The 'ProcessDefinition' type also defines a @terminateHandler@,
+-- which is called whenever the process exits, whether because a callback has
+-- returned 'stop' as the next action, or as the result of unhandled exit signal
+-- or similar asynchronous exceptions thrown in (or to) the process itself.
 --
 -- The other handlers are split into two groups: /apiHandlers/ and /infoHandlers/.
 -- The former contains handlers for the 'cast' and 'call' protocols, whilst the
@@ -68,8 +66,8 @@
 -- which take expressions (i.e., a function or lambda expression) and create the
 -- appropriate @Dispatcher@ for handling the cast (or call).
 --
--- The cast/call protocol handlers deal with /expected/ inputs. These form
--- the explicit public API for the process, and will usually be exposed by
+-- These cast/call protocols are for dealing with /expected/ inputs. They
+-- will usually form the explicit public API for the process, and be exposed by
 -- providing module level functions that defer to the cast/call API, giving
 -- the author an opportunity to enforce the correct types. For
 -- example:
@@ -81,14 +79,25 @@
 -- @
 --
 -- Note here that the return type from the call is /inferred/ and will not be
--- enforced by the type system. If the server sends a different type back in
--- the reply, then the caller will be blocked indefinitely! This is a slight
--- disadvantage of the loose coupling between client and server, but it does
--- allow servers to handle a variety of messages without specifying the entire
--- protocol to be supported in excruciating detail. If the latter approach
--- appeals, then the "Control.Distributed.Process.Platform.Session" API might
--- be more to your tastes. Note that /that/ API cannot handle unanticipated
--- messages, in the same way that managed processes can.
+-- enforced by the type system. If the server sent a different type back in
+-- the reply, then the caller might be blocked indefinitely! In fact, the
+-- result of mis-matching the expected return type (in the client facing API)
+-- with the actual type returned by the server is more severe in practise.
+-- The underlying types that implement the /call/ protocol carry information
+-- about the expected return type. If there is a mismatch between the input and
+-- output types that the client API uses and those which the server declares it
+-- can handle, then the message will be considered unroutable - no handler will
+-- be executed against it and the unhandled message policy will be applied. You
+-- should, therefore, take great care to align these types since the default
+-- unhandled message policy is to terminate the server! That might seem pretty
+-- extreme, but you can alter the unhandled message policy and/or use the
+-- various overloaded versions of the call API in order to detect errors on the
+-- server such as this.
+--
+-- The cost of potential type mismatches between the client and server is the
+-- main disadvantage of this looser coupling between them. This mechanism does
+-- however, allow servers to handle a variety of messages without specifying the
+-- entire protocol to be supported in excruciating detail.
 --
 -- [Handling Unexpected/Info Messages]
 --
@@ -136,7 +145,7 @@
 -- which provides a StateT based monad for building referentially transparent
 -- callbacks.
 --
--- See "Control.Distributed.Process.Platform.ManagedProcess.Server.Pure" for
+-- See "Control.Distributed.Process.Platform.ManagedProcess.Server.Restricted" for
 -- details and API documentation.
 --
 -- [Handling Errors]
@@ -192,22 +201,86 @@
 -- (such as resource cleanup) then you should avoid linking you process
 -- and use monitors instead.
 --
+-- [Prioritised Mailboxes]
+--
+-- Many processes need to prioritise certain classes of message over others,
+-- so two subsets of the API are given to supporting those cases.
+--
+-- A 'PrioritisedProcessDefintion' combines the usual 'ProcessDefintion' -
+-- containing the cast/call API, error, termination and info handlers - with a
+-- list of 'Priority' entries, which are used at runtime to prioritise the
+-- server's inputs. Note that it is only messages which are prioritised; The
+-- server's various handlers are still evaluated in insertion order.
+--
+-- Prioritisation does not guarantee that a prioritised message/type will be
+-- processed before other traffic - indeed doing so in a multi-threaded runtime
+-- would be very hard - but in the absence of races between multiple processes,
+-- if two messages are both present in the process' own mailbox, they will be
+-- applied to the ProcessDefinition's handler's in priority order. This is
+-- achieved by draining the real mailbox into a priority queue and processing
+-- each message in turn.
+--
+-- A prioritised process must be configured with a 'Priority' list to be of
+-- any use. Creating a prioritised process without any priorities would be a
+-- big waste of computational resources, and it is worth thinking carefully
+-- about whether or not prioritisation is truly necessary in your design before
+-- choosing to use it.
+--
+-- Using a prioritised process is as simple as calling 'pserve' instead of
+-- 'serve', and passing an initialised 'PrioritisedProcessDefinition'.
+--
+-- [Control Channels]
+--
+-- For advanced users and those requiring very low latency, a prioritised
+-- process definition might not be suitable, since it performs considerable
+-- work /behind the scenes/. There are also designs that wish to segregate a
+-- process' /control plane/ from other kinds of traffic it is expected to
+-- receive. For such use cases, a /control channel/ may prove a better choice,
+-- since typed channels are already prioritised during the mailbox scans that
+-- the base @receiveWait@ and @receiveTimeout@ primitives from
+-- distribute-process provides.
+--
+-- In order to utilise a /control channel/, it is necessary to start the process
+-- using 'chanServe'. Instead of passing in an initialised 'ProcessDefinition',
+-- this requires an expression that takes an opaque 'ControlChannel' and yields
+-- the 'ProcessDefinition' in the 'Process' monad. Providing the opaque reference
+-- in this fashion is necessary, since the type of messages the control channel
+-- carries does not correlate directly to the inter-process traffic it uses
+-- internally. The API for creating handlers that respond to /control channel/
+-- inputs (i.e., 'handleControlChan' and 'handleControlChan_') also requires the
+-- reference to be passed with the handler expression.
+--
+-- In order for clients to communicate with a server via its control channel,
+-- they must pass a handle to a 'ControlPort', which can be obtained by
+-- evaluating 'channelControlPort' on the 'ControlChannel' passed to the
+-- expression which yields the 'ProcessDefinition'. It is for this reason that
+-- we evaluate the 'ProcessDefinition' construction in the process monad, since
+-- using an @MVar@ or @STM@ construct is the easiest way to have the channel's
+-- control port /escape/ to the outside world. A 'ControlPort' is @Serializable@,
+-- so they can alternatively be sent to other processes.
+--
+-- /Control channel/ traffic will only be prioritised over other traffic if the
+-- handlers using it are present before others (e.g., @handleInfo, handleCast@,
+-- etc) in the process definition. It is not possible to combine prioritised
+-- processes with /control channels/.
+--
 -- [Performance Considerations]
 --
--- The server implementations are fairly well optimised already, but there /is/
--- a cost associated with scanning the mailbox to match on protocol messages,
--- and additional costs (i.e., space /and/ time) in mapping over all available
+-- The server implementations are fairly optimised, but there /is/ a definite
+-- cost associated with scanning the mailbox to match on protocol messages,
+-- plus additional costs in space and time due to mapping over all available
 -- /info handlers/ for non-protocol (i.e., neither /call/ nor /cast/) messages.
--- There are further costs when using prioritisation, in priority space/storage
--- and in per-message processing (where priorities must be applied and matched
--- against incoming messages).
+-- These are exacerbated when using prioritisation.
 --
--- In clients, it's important to remember that the /call/ protocol will wait
--- for a reply in most cases, triggering a full O(n) scan of the caller's
--- mailbox. If the mailbox is extremely full and calls are regularly made, this
--- may have a significant impact on the caller. The @callChan@ family of client
--- API functions can alleviate this, by using (and matching on) a private typed
--- channel instead, but the server must be written to accomodate this.
+-- From the client perspective, it's important to remember that the /call/
+-- protocol will wait for a reply in most cases, triggering a full O(n) scan of
+-- the caller's mailbox. If the mailbox is extremely full and calls are
+-- regularly made, this may have a significant impact on the caller. The
+-- @callChan@ family of client API functions can alleviate this, by using (and
+-- matching on) a private typed channel instead, but the server must be written
+-- to accomodate this. Similar gains can be had using a /control channel/,
+-- though only one /control channel/ is allowed per process definition, limiting
+-- the input space to just one type.
 --
 -----------------------------------------------------------------------------
 
@@ -217,6 +290,7 @@ module Control.Distributed.Process.Platform.ManagedProcess
   , InitHandler
   , serve
   , pserve
+  , chanServe
   , runProcess
   , prioritised
     -- * Client interactions
@@ -224,6 +298,7 @@ module Control.Distributed.Process.Platform.ManagedProcess
     -- * Defining server processes
   , ProcessDefinition(..)
   , PrioritisedProcessDefinition(..)
+  , RecvTimeoutPolicy(..)
   , Priority(..)
   , DispatchPriority()
   , Dispatcher()
@@ -232,10 +307,13 @@ module Control.Distributed.Process.Platform.ManagedProcess
   , TimeoutHandler
   , ProcessAction(..)
   , ProcessReply
+  , Condition
   , CallHandler
   , CastHandler
   , UnhandledMessagePolicy(..)
   , CallRef
+  , ControlChannel()
+  , ControlPort()
   , defaultProcess
   , defaultProcessWithPriorities
   , statelessProcess
@@ -248,6 +326,7 @@ module Control.Distributed.Process.Platform.ManagedProcess
   , handleCast
   , handleCastIf
   , handleInfo
+  , handleRaw
   , handleRpcChan
   , handleRpcChanIf
   , action
@@ -262,6 +341,10 @@ module Control.Distributed.Process.Platform.ManagedProcess
   , handleCastIf_
   , handleRpcChan_
   , handleRpcChanIf_
+    -- * Control channels
+  , handleControlChan
+  , handleControlChan_
+  , channelControlPort
     -- * Prioritised mailboxes
   , module Control.Distributed.Process.Platform.ManagedProcess.Server.Priority
     -- * Constructing handler results
@@ -286,7 +369,7 @@ module Control.Distributed.Process.Platform.ManagedProcess
   , replyChan
   ) where
 
-import Control.Distributed.Process hiding (call)
+import Control.Distributed.Process hiding (call, Message)
 import Control.Distributed.Process.Platform.ManagedProcess.Client
 import Control.Distributed.Process.Platform.ManagedProcess.Server
 import Control.Distributed.Process.Platform.ManagedProcess.Server.Priority
@@ -294,6 +377,7 @@ import Control.Distributed.Process.Platform.ManagedProcess.Internal.GenProcess
 import Control.Distributed.Process.Platform.ManagedProcess.Internal.Types
 import Control.Distributed.Process.Platform.Internal.Types (ExitReason(..))
 import Control.Distributed.Process.Platform.Time
+import Control.Distributed.Process.Serializable
 import Prelude hiding (init)
 
 -- TODO: automatic registration
@@ -313,6 +397,43 @@ pserve :: a
        -> PrioritisedProcessDefinition s
        -> Process ()
 pserve argv init def = runProcess (precvLoop def) argv init
+
+-- | Starts a managed process, configured with a typed /control channel/. The
+-- caller supplied expression is evaluated with an opaque reference to the
+-- channel, which must be passed when calling @handleControlChan@. The meaning
+-- and behaviour of the init handler and initial arguments are the same as
+-- those given to 'serve'.
+--
+chanServe :: (Serializable b)
+          => a
+          -> InitHandler a s
+          -> (ControlChannel b -> Process (ProcessDefinition s))
+          -> Process ()
+chanServe argv init mkDef = do
+  pDef <- mkDef . ControlChannel =<< newChan
+  runProcess (recvLoop pDef) argv init
+
+-- TODO: Make this work!!!!!!!!!!
+{-
+stmChanServe :: a
+             -> InitHandler a s
+             -> STM b
+             -> (StmControlChannel b -> Process (ProcessDefintion s))
+             -> Process ()
+stmChanServe = undefined
+-}
+
+-- TODO: Make this work???
+{-
+busServe :: (Serializable b, MessageMatcher m) =>
+         => a
+         -> InitHandler a s
+         -> m
+         -> (ControlPlane b -> Process (ProcessDefintion s))
+         -> Process ()
+busServe argv init m mkDef = do
+  pDef <- mkDef $ ControlPlane m
+-}
 
 -- | Wraps any /process loop/ and enforces that it adheres to the
 -- managed process' start/stop semantics, i.e., evaluating the
@@ -353,10 +474,13 @@ defaultProcess = ProcessDefinition {
 prioritised :: ProcessDefinition s
             -> [DispatchPriority s]
             -> PrioritisedProcessDefinition s
-prioritised def ps = PrioritisedProcessDefinition def ps
+prioritised def ps = PrioritisedProcessDefinition def ps defaultRecvTimeoutPolicy
+
+defaultRecvTimeoutPolicy :: RecvTimeoutPolicy
+defaultRecvTimeoutPolicy = RecvCounter 10000
 
 defaultProcessWithPriorities :: [DispatchPriority s] -> PrioritisedProcessDefinition s
-defaultProcessWithPriorities = PrioritisedProcessDefinition defaultProcess
+defaultProcessWithPriorities dps = prioritised defaultProcess dps
 
 -- | A basic, stateless process definition, where the unhandled message policy
 -- is set to 'Terminate', the default timeout handlers does nothing (i.e., the
@@ -368,4 +492,3 @@ statelessProcess = defaultProcess :: ProcessDefinition ()
 -- 'statelessProcess'.
 statelessInit :: Delay -> InitHandler () ()
 statelessInit d () = return $ InitOk () d
-

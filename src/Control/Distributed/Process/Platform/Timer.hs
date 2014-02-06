@@ -38,7 +38,8 @@ module Control.Distributed.Process.Platform.Timer
 import Control.DeepSeq (NFData)
 import Control.Distributed.Process hiding (send)
 import Control.Distributed.Process.Serializable
-import Control.Distributed.Process.Platform (send, NFSerializable)
+import Control.Distributed.Process.Platform.UnsafePrimitives (send)
+import Control.Distributed.Process.Platform.Internal.Types (NFSerializable)
 import Control.Distributed.Process.Platform.Time
 import Data.Binary
 import Data.Typeable (Typeable)
@@ -77,7 +78,6 @@ instance NFData SleepingPill where
 sleep :: TimeInterval -> Process ()
 sleep t =
   let ms = asTimeout t in do
-  -- liftIO $ putStrLn $ "sleeping for " ++ (show ms) ++ "micros"
   _ <- receiveTimeout ms [matchIf (\SleepingPill -> True)
                                   (\_ -> return ())]
   return ()

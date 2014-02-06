@@ -1,8 +1,10 @@
-{-# LANGUAGE DeriveDataTypeable     #-}
-{-# LANGUAGE TemplateHaskell        #-}
-{-# LANGUAGE TypeSynonymInstances   #-}
-{-# LANGUAGE FlexibleInstances      #-}
-{-# LANGUAGE ScopedTypeVariables    #-}
+{-# LANGUAGE DeriveDataTypeable    #-}
+{-# LANGUAGE DeriveGeneric         #-}
+{-# LANGUAGE StandaloneDeriving    #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TemplateHaskell       #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances     #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -20,9 +22,14 @@
 
 module Control.Distributed.Process.Platform.Internal.Primitives
   ( -- * General Purpose Process Addressing
-    Addressable(..)
+    Addressable
+  , Routable(..)
+  , Resolvable(..)
+  , Linkable(..)
+  , Killable(..)
 
     -- * Spawning and Linking
+  , spawnSignalled
   , spawnLinkLocal
   , spawnMonitorLocal
   , linkOnFailure
@@ -39,8 +46,10 @@ module Control.Distributed.Process.Platform.Internal.Primitives
     -- * General Utilities
   , times
   , monitor
+  , awaitExit
   , isProcessAlive
   , forever'
+  , deliver
 
     -- * Remote Table
   , __remoteTable
@@ -52,7 +61,11 @@ import qualified Control.Distributed.Process as P (monitor)
 import Control.Distributed.Process.Closure (seqCP, remotable, mkClosure)
 import Control.Distributed.Process.Serializable (Serializable)
 import Control.Distributed.Process.Platform.Internal.Types
-  ( Addressable(..)
+  ( Addressable
+  , Linkable(..)
+  , Killable(..)
+  , Resolvable(..)
+  , Routable(..)
   , RegisterSelf(..)
   , ExitReason(ExitOther)
   , whereisRemote
@@ -62,12 +75,29 @@ import Data.Maybe (isJust, fromJust)
 
 -- utility
 
-monitor :: Addressable a => a -> Process (Maybe MonitorRef)
+-- | Monitor any @Resolvable@ object.
+--
+monitor :: Resolvable a => a -> Process (Maybe MonitorRef)
 monitor addr = do
   mPid <- resolve addr
   case mPid of
     Nothing -> return Nothing
     Just p  -> return . Just =<< P.monitor p
+
+awaitExit :: Resolvable a => a -> Process ()
+awaitExit addr = do
+  mPid <- resolve addr
+  case mPid of
+    Nothing -> return ()
+    Just p  -> do
+      mRef <- P.monitor p
+      receiveWait [
+          matchIf (\(ProcessMonitorNotification r p' _) -> r == mRef && p == p')
+                  (\_ -> return ())
+        ]
+
+deliver :: (Addressable a, Serializable m) => m -> a -> Process ()
+deliver = flip sendTo
 
 isProcessAlive :: ProcessId -> Process Bool
 isProcessAlive pid = getProcessInfo pid >>= \info -> return $ info /= Nothing
@@ -86,6 +116,25 @@ forever' a = let a' = a >> a' in a'
 
 -- spawning, linking and generic server startup
 
+-- | Spawn a new (local) process. This variant takes an initialisation
+-- action and a secondary expression from the result of the initialisation
+-- to @Process ()@. The spawn operation synchronises on the completion of the
+-- @before@ action, such that the calling process is guaranteed to only see
+-- the newly spawned @ProcessId@ once the initialisation has successfully
+-- completed.
+spawnSignalled :: Process a -> (a -> Process ()) -> Process ProcessId
+spawnSignalled before after = do
+  (sigStart, recvStart) <- newChan
+  (pid, mRef) <- spawnMonitorLocal $ do
+    initProc <- before
+    sendChan sigStart ()
+    after initProc
+  receiveWait [
+      matchIf (\(ProcessMonitorNotification ref _ _) -> ref == mRef)
+              (\(ProcessMonitorNotification _ _ dr) -> die $ ExitOther (show dr))
+    , matchChan recvStart (\() -> return pid)
+    ]
+
 -- | Node local version of 'Control.Distributed.Process.spawnLink'.
 -- Note that this is just the sequential composition of 'spawn' and 'link'.
 -- (The "Unified" semantics that underlies Cloud Haskell does not even support
@@ -96,7 +145,8 @@ spawnLinkLocal p = do
   link pid
   return pid
 
--- | Like 'spawnLinkLocal', but monitor the spawned process
+-- | Like 'spawnLinkLocal', but monitors the spawned process.
+--
 spawnMonitorLocal :: Process () -> Process (ProcessId, MonitorRef)
 spawnMonitorLocal p = do
   pid <- spawnLocal p
@@ -106,6 +156,7 @@ spawnMonitorLocal p = do
 -- | CH's 'link' primitive, unlike Erlang's, will trigger when the target
 -- process dies for any reason. This function has semantics like Erlang's:
 -- it will trigger 'ProcessLinkException' only when the target dies abnormally.
+--
 linkOnFailure :: ProcessId -> Process ()
 linkOnFailure them = do
   us <- getSelfPid
@@ -129,6 +180,7 @@ linkOnFailure them = do
 -- under the given name. This refers to a local, per-node registration,
 -- not @global@ registration. If that name is unregistered, a process
 -- is started. This is a handy way to start per-node named servers.
+--
 whereisOrStart :: String -> Process () -> Process ProcessId
 whereisOrStart name proc =
   do mpid <- whereis name
@@ -169,6 +221,7 @@ $(remotable ['registerSelf])
 -- | A remote equivalent of 'whereisOrStart'. It deals with the
 -- node registry on the given node, and the process, if it needs to be started,
 -- will run on that node. If the node is inaccessible, Nothing will be returned.
+--
 whereisOrStartRemote :: NodeId -> String -> Closure (Process ()) -> Process (Maybe ProcessId)
 whereisOrStartRemote nid name proc =
      do mRef <- monitorNode nid

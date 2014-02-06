@@ -5,6 +5,7 @@
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE StandaloneDeriving         #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -- | Types used throughout the ManagedProcess framework
 module Control.Distributed.Process.Platform.ManagedProcess.Internal.Types
@@ -28,6 +29,10 @@ module Control.Distributed.Process.Platform.ManagedProcess.Internal.Types
   , Priority(..)
   , DispatchPriority(..)
   , PrioritisedProcessDefinition(..)
+  , RecvTimeoutPolicy(..)
+  , ControlChannel(..)
+  , ControlPort(..)
+  , channelControlPort
   , Dispatcher(..)
   , DeferredDispatcher(..)
   , ExitSignalDispatcher(..)
@@ -49,7 +54,9 @@ import Control.Distributed.Process.Serializable
 import Control.Distributed.Process.Platform.Internal.Types
   ( Recipient(..)
   , ExitReason(..)
-  , Addressable(..)
+  , Addressable
+  , Resolvable(..)
+  , Routable(..)
   , NFSerializable
   )
 import Control.Distributed.Process.Platform.Time
@@ -75,8 +82,10 @@ instance NFData a => NFData (CallRef a) where
 makeRef :: forall a . (Serializable a) => Recipient -> CallId -> CallRef a
 makeRef r c = CallRef (r, c)
 
-instance Addressable (CallRef a) where
-  resolve (CallRef (r, _))            = resolve r
+instance Resolvable (CallRef a) where
+  resolve (CallRef (r, _)) = resolve r
+
+instance Routable (CallRef a) where
   sendTo  (CallRef (client, tag)) msg = sendTo client (CallResponse msg tag)
   unsafeSendTo (CallRef (c, tag)) msg = unsafeSendTo c (CallResponse msg tag)
 
@@ -171,6 +180,51 @@ type TimeoutHandler s = s -> Delay -> Process (ProcessAction s)
 
 -- dispatching to implementation callbacks
 
+-- TODO: Now that we've got matchSTM available, we can have two kinds of CC.
+-- The easiest approach would be to add an StmControlChannel newtype, since
+-- that can't be Serializable (and will have to rely on PCopy for delivery).
+-- Rather than write stmChanServe in terms of creating that channel object
+-- ourselves (which is necessary for the TypedChannel based approach we
+-- currently offer), I think it should accept the (STM a) "read" action and
+-- leave the PCopy based delivery nonsense to the user, since we don't want
+-- to /encourage/ that sort of thing outside of this codebase.
+
+{-
+
+data InputChannelDispatcher =
+  InputChannelDispatcher { chan :: InputChannel s
+                         , dispatch :: s -> Message a b -> Process (ProcessAction s)
+                         }
+
+instance MessageMatcher Dispatcher where
+  matchDispatch _ _ (DispatchInputChannelDispatcher c d) = matchInputChan (d s)
+-}
+
+-- | Provides a means for servers to listen on a separate, typed /control/
+-- channel, thereby segregating the channel from their regular
+-- (and potentially busy) mailbox.
+newtype ControlChannel m =
+  ControlChannel {
+      unControl :: (SendPort (Message m ()), ReceivePort (Message m ()))
+    }
+
+-- | The writable end of a 'ControlChannel'.
+--
+newtype ControlPort m =
+  ControlPort {
+      unPort :: SendPort (Message m ())
+    } deriving (Show)
+deriving instance (Serializable m) => Binary (ControlPort m)
+instance Eq (ControlPort m) where
+  a == b = unPort a == unPort b
+
+-- | Obtain an opaque expression for communicating with a 'ControlChannel'.
+--
+channelControlPort :: (Serializable m)
+                   => ControlChannel m
+                   -> ControlPort m
+channelControlPort cc = ControlPort $ fst $ unControl cc
+
 -- | Provides dispatch from cast and call messages to a typed handler.
 data Dispatcher s =
     forall a b . (Serializable a, Serializable b) =>
@@ -183,6 +237,12 @@ data Dispatcher s =
     {
       dispatch   :: s -> Message a b -> Process (ProcessAction s)
     , dispatchIf :: s -> Message a b -> Bool
+    }
+  | forall a b . (Serializable a, Serializable b) =>
+    DispatchCC  -- control channel dispatch
+    {
+      channel  :: ReceivePort (Message a b)
+    , dispatch :: s -> Message a b -> Process (ProcessAction s)
     }
 
 -- | Provides dispatch for any input, returns 'Nothing' for unhandled messages.
@@ -210,6 +270,7 @@ class MessageMatcher d where
 instance MessageMatcher Dispatcher where
   matchDispatch _ s (Dispatch   d)      = match (d s)
   matchDispatch _ s (DispatchIf d cond) = matchIf (cond s) (d s)
+  matchDispatch _ s (DispatchCC c d)    = matchChan c (d s)
 
 class DynMessageHandler d where
   dynHandleMessage :: UnhandledMessagePolicy
@@ -221,6 +282,7 @@ class DynMessageHandler d where
 instance DynMessageHandler Dispatcher where
   dynHandleMessage _ s (Dispatch   d)   msg = handleMessage   msg (d s)
   dynHandleMessage _ s (DispatchIf d c) msg = handleMessageIf msg (c s) (d s)
+  dynHandleMessage _ _ (DispatchCC _ _) _   = error "ThisCanNeverHappen"
 
 instance DynMessageHandler DeferredDispatcher where
   dynHandleMessage _ s (DeferredDispatcher d) = d s
@@ -241,11 +303,28 @@ data DispatchPriority s =
       prioritise :: s -> P.Message -> Process (Maybe (Int, P.Message))
     }
 
+-- | For a 'PrioritisedProcessDefinition', this policy determines for how long
+-- the /receive loop/ should continue draining the process' mailbox before
+-- processing its received mail (in priority order).
+--
+-- If a prioritised /managed process/ is receiving a lot of messages (into its
+-- /real/ mailbox), the server might never get around to actually processing its
+-- inputs. This (mandatory) policy provides a guarantee that eventually (i.e.,
+-- after a specified number of received messages or time interval), the server
+-- will stop removing messages from its mailbox and process those it has already
+-- received.
+--
+data RecvTimeoutPolicy = RecvCounter Int | RecvTimer TimeInterval
+  deriving (Typeable)
+
+-- | A @ProcessDefinition@ decorated with @DispatchPriority@ for certain
+-- input domains.
 data PrioritisedProcessDefinition s =
   PrioritisedProcessDefinition
   {
-    processDef :: ProcessDefinition s
-  , priorities :: [DispatchPriority s]
+    processDef  :: ProcessDefinition s
+  , priorities  :: [DispatchPriority s]
+  , recvTimeout :: RecvTimeoutPolicy
   }
 
 -- | Policy for handling unexpected messages, i.e., messages which are not
@@ -287,7 +366,8 @@ data ProcessDefinition s = ProcessDefinition {
 
 -- TODO: Generify this /call/ API and use it in Call.hs to avoid tagging
 
-initCall :: forall s a b . (Addressable s, Serializable a, Serializable b)
+initCall :: forall s a b . (Addressable s,
+                            Serializable a, Serializable b)
          => s -> a -> Process (CallRef b)
 initCall sid msg = do
   (Just pid) <- resolve sid
@@ -297,7 +377,8 @@ initCall sid msg = do
     sendTo pid $ ((CallMessage msg cRef) :: Message a b)
     return cRef
 
-unsafeInitCall :: forall s a b . (Addressable s, NFSerializable a, NFSerializable b)
+unsafeInitCall :: forall s a b . (Addressable s,
+                                  NFSerializable a, NFSerializable b)
          => s -> a -> Process (CallRef b)
 unsafeInitCall sid msg = do
   (Just pid) <- resolve sid
