@@ -3,10 +3,14 @@ CABAL=distributed-process-platform.cabal
 BUILD_DEPENDS=$(CONF) $(CABAL)
 
 BASE_GIT := git://github.com/haskell-distributed
+CLONES_DIR := 'git-clones'
 REPOS=$(shell cat REPOS | sed '/^$$/d')
 
 .PHONY: all
-all: build
+all: init build
+
+.PHONY: init
+init: $(REPOS) sandbox deps
 
 .PHONY: test
 test: build
@@ -27,6 +31,7 @@ $(BUILD_DEPENDS): sandbox
 
 .PHONY: deps
 deps: $(REPOS) sandbox
+	cabal install --only-dependencies
 	cabal install --enable-tests
 
 $(REPOS): sandbox
