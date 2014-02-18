@@ -27,7 +27,6 @@ import Control.Distributed.Process.Platform.Supervisor hiding (start, shutdown)
 import qualified Control.Distributed.Process.Platform.Supervisor as Supervisor
 import Control.Distributed.Process.Platform.ManagedProcess.Client (shutdown)
 import Control.Distributed.Process.Serializable()
-import Control.Distributed.Process.Platform.Service.SystemLog hiding (logMessage, error)
 
 import Control.Distributed.Static (staticLabel)
 import Control.Monad (void, forM_, forM)
@@ -816,7 +815,7 @@ restartLeftWhenLeftmostChildDies cs sup = do
 restartWithoutTempChildren :: ChildStart -> ProcessId -> Process ()
 restartWithoutTempChildren cs sup = do
   (ChildAdded refTrans) <- startNewChild sup $ transientWorker cs
-  (ChildAdded refTemp)  <- startNewChild sup $ tempWorker cs
+  (ChildAdded _)        <- startNewChild sup $ tempWorker cs
   (ChildAdded refPerm)  <- startNewChild sup $ permChild cs
   Just pid2 <- resolve refTrans
   Just pid3 <- resolve refPerm
