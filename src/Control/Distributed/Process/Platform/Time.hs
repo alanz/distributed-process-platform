@@ -43,6 +43,13 @@ module Control.Distributed.Process.Platform.Time
   , timeout
   , infiniteWait
   , noWait
+
+  -- To/From NominalDiffTime
+  , timeIntervalToDiffTime
+  , diffTimeToTimeInterval
+  , diffTimeToDelay
+  , delayToDiffTime
+  , microsecondsToNominalDiffTime
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -51,6 +58,8 @@ import Control.Distributed.Process
 import Control.Distributed.Process.Platform.Internal.Types
 import Control.Monad (void)
 import Data.Binary
+import Data.Ratio ((%))
+import Data.Time.Clock
 import Data.Typeable (Typeable)
 
 import GHC.Generics
@@ -161,6 +170,10 @@ secondsPerMinute = 60
 milliSecondsPerSecond :: Int
 milliSecondsPerSecond = 1000
 
+{-# INLINE microSecondsPerSecond #-}
+microSecondsPerSecond :: Int
+microSecondsPerSecond = 1000000
+
 -- timeouts/delays (microseconds)
 
 -- | Constructs an inifinite 'Timeout'.
@@ -177,3 +190,78 @@ timeout time tag p =
   void $ spawnLocal $
                do liftIO $ threadDelay time
                   send p (TimeoutNotification tag)
+
+
+-- Converting to/from Data.Time.Clock NominalDiffTime
+
+-- | given a @TimeInterval@, provide an equivalent @NominalDiffTim@
+timeIntervalToDiffTime :: TimeInterval -> NominalDiffTime
+timeIntervalToDiffTime ti = microsecondsToNominalDiffTime (fromIntegral $ asTimeout ti)
+
+-- | given a @NominalDiffTim@@, provide an equivalent @TimeInterval@
+diffTimeToTimeInterval :: NominalDiffTime -> TimeInterval
+diffTimeToTimeInterval dt = microSeconds $ (fromIntegral ((round dt)::Integer) `div` 1000000)
+
+
+-- | given a @Delay@, provide an equivalent @NominalDiffTim@
+delayToDiffTime :: Delay -> NominalDiffTime
+delayToDiffTime (Delay ti) = timeIntervalToDiffTime ti
+-- delayToDiffTime Infinity = microsecondsToNominalDiffTime tenYearsAsMicroSeconds
+delayToDiffTime Infinity = error "trying to convert Delay.Infinity to a NominalDiffTime"
+delayToDiffTime (NoDelay)  = microsecondsToNominalDiffTime 0
+
+
+-- | given a @NominalDiffTim@@, provide an equivalent @Delay@
+diffTimeToDelay :: NominalDiffTime -> Delay
+diffTimeToDelay dt = Delay $ diffTimeToTimeInterval dt
+
+
+-- | Create a 'NominalDiffTime' from a number of microseconds.
+microsecondsToNominalDiffTime :: Integer -> NominalDiffTime
+microsecondsToNominalDiffTime x = fromRational (x % (fromIntegral microSecondsPerSecond))
+
+tenYearsAsMicroSeconds :: Integer
+tenYearsAsMicroSeconds = 10 * 365 * 24 * 60 * 60 * 1000000
+
+-- | Allow @(+)@ and @(-)@ operations on @TimeInterval@s
+instance Num TimeInterval where
+  t1 + t2 = microSeconds $ asTimeout t1 + asTimeout t2
+  t1 - t2 = microSeconds $ asTimeout t1 - asTimeout t2
+  _ * _ = error "trying to multiply two TimeIntervals"
+  abs t = microSeconds $ abs (asTimeout t)
+  signum t = if (asTimeout t) == 0
+              then 0
+              else if (asTimeout t) < 0 then -1
+                                        else 1
+  fromInteger _ = error "trying to call fromInteger for a TimeInterval. Cannot guess units"
+
+
+-- | Allow @(+)@ and @(-)@ operations on @Delay@s
+instance Num Delay where
+  NoDelay  + x = x
+  Infinity + _ = Infinity
+  x + NoDelay  = x
+  _ + Infinity = Infinity
+  (Delay t1 ) + (Delay t2) = Delay (t1 + t2)
+
+  NoDelay  - x = x
+  Infinity - _ = Infinity
+  x - NoDelay  = x
+  _ - Infinity = Infinity
+  (Delay t1 ) - (Delay t2) = Delay (t1 - t2)
+
+  _ * _ = error "trying to multiply two Delays"
+  abs NoDelay = NoDelay
+  abs Infinity = Infinity
+  abs (Delay t) = Delay (abs t)
+
+  signum (NoDelay) = 0
+  signum Infinity = 1
+  signum (Delay t) = Delay (signum t)
+
+  fromInteger 0 = NoDelay
+  fromInteger _ = error "trying to call fromInteger for a Delay. Cannot guess units"
+
+
+
+
