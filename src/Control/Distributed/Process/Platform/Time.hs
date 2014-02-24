@@ -1,12 +1,10 @@
-{-# LANGUAGE CPP                 #-}
 {-# LANGUAGE DeriveDataTypeable  #-}
 {-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE TemplateHaskell     #-}
 
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Control.Distributed.Process.Platform.Time
--- Copyright   :  (c) Tim Watson, Jeff Epstein
+-- Copyright   :  (c) Tim Watson, Jeff Epstein, Alan Zimmerman
 -- License     :  BSD3 (see the file LICENSE)
 --
 -- Maintainer  :  Tim Watson
@@ -15,15 +13,16 @@
 --
 -- This module provides facilities for working with time delays and timeouts.
 -- The type 'Timeout' and the 'timeout' family of functions provide mechanisms
--- for working with @threadDelay@-like behaviour operates on microsecond values.
+-- for working with @threadDelay@-like behaviour that operates on microsecond
+-- values.
 --
 -- The 'TimeInterval' and 'TimeUnit' related functions provide an abstraction
--- for working with various time intervals and the 'Delay' type provides a
+-- for working with various time intervals, whilst the 'Delay' type provides a
 -- corrolary to 'timeout' that works with these.
 -----------------------------------------------------------------------------
 
 module Control.Distributed.Process.Platform.Time
-  ( -- time interval handling
+  ( -- * Time interval handling
     microSeconds
   , milliSeconds
   , seconds
@@ -37,7 +36,14 @@ module Control.Distributed.Process.Platform.Time
   , TimeUnit(..)
   , Delay(..)
 
-  -- timeouts
+  -- * Conversion To/From NominalDiffTime
+  , timeIntervalToDiffTime
+  , diffTimeToTimeInterval
+  , diffTimeToDelay
+  , delayToDiffTime
+  , microsecondsToNominalDiffTime
+
+    -- * (Legacy) Timeout Handling
   , Timeout
   , TimeoutNotification(..)
   , timeout
@@ -85,7 +91,7 @@ instance NFData TimeInterval where
 -- | Represents either a delay of 'TimeInterval', an infinite wait or no delay
 -- (i.e., non-blocking).
 data Delay = Delay TimeInterval | Infinity | NoDelay
-    deriving (Typeable, Generic, Eq, Show)  -- TODO: ord/cmp
+    deriving (Typeable, Generic, Eq, Show)
 
 instance Binary Delay where
 instance NFData Delay where
@@ -102,9 +108,9 @@ instance Binary TimeoutNotification where
   get = fmap TimeoutNotification $ get
   put (TimeoutNotification n) = put n
 
--- time interval/unit handling (milliseconds)
+-- time interval/unit handling
 
--- | converts the supplied @TimeInterval@ to milliseconds
+-- | converts the supplied @TimeInterval@ to microseconds
 asTimeout :: TimeInterval -> Int
 asTimeout (TimeInterval u v) = timeToMicros u v
 
@@ -191,7 +197,6 @@ timeout time tag p =
                do liftIO $ threadDelay time
                   send p (TimeoutNotification tag)
 
-
 -- Converting to/from Data.Time.Clock NominalDiffTime
 
 -- | given a @TimeInterval@, provide an equivalent @NominalDiffTim@
@@ -202,26 +207,22 @@ timeIntervalToDiffTime ti = microsecondsToNominalDiffTime (fromIntegral $ asTime
 diffTimeToTimeInterval :: NominalDiffTime -> TimeInterval
 diffTimeToTimeInterval dt = microSeconds $ (fromIntegral ((round dt)::Integer) `div` 1000000)
 
-
 -- | given a @Delay@, provide an equivalent @NominalDiffTim@
 delayToDiffTime :: Delay -> NominalDiffTime
 delayToDiffTime (Delay ti) = timeIntervalToDiffTime ti
--- delayToDiffTime Infinity = microsecondsToNominalDiffTime tenYearsAsMicroSeconds
-delayToDiffTime Infinity = error "trying to convert Delay.Infinity to a NominalDiffTime"
+delayToDiffTime Infinity   = error "trying to convert Delay.Infinity to a NominalDiffTime"
 delayToDiffTime (NoDelay)  = microsecondsToNominalDiffTime 0
-
 
 -- | given a @NominalDiffTim@@, provide an equivalent @Delay@
 diffTimeToDelay :: NominalDiffTime -> Delay
 diffTimeToDelay dt = Delay $ diffTimeToTimeInterval dt
 
-
 -- | Create a 'NominalDiffTime' from a number of microseconds.
 microsecondsToNominalDiffTime :: Integer -> NominalDiffTime
 microsecondsToNominalDiffTime x = fromRational (x % (fromIntegral microSecondsPerSecond))
 
-tenYearsAsMicroSeconds :: Integer
-tenYearsAsMicroSeconds = 10 * 365 * 24 * 60 * 60 * 1000000
+-- tenYearsAsMicroSeconds :: Integer
+-- tenYearsAsMicroSeconds = 10 * 365 * 24 * 60 * 60 * 1000000
 
 -- | Allow @(+)@ and @(-)@ operations on @TimeInterval@s
 instance Num TimeInterval where
@@ -235,33 +236,30 @@ instance Num TimeInterval where
                                         else 1
   fromInteger _ = error "trying to call fromInteger for a TimeInterval. Cannot guess units"
 
-
 -- | Allow @(+)@ and @(-)@ operations on @Delay@s
 instance Num Delay where
-  NoDelay  + x = x
-  Infinity + _ = Infinity
-  x + NoDelay  = x
-  _ + Infinity = Infinity
+  NoDelay     + x          = x
+  Infinity    + _          = Infinity
+  x           + NoDelay    = x
+  _           + Infinity   = Infinity
   (Delay t1 ) + (Delay t2) = Delay (t1 + t2)
 
-  NoDelay  - x = x
-  Infinity - _ = Infinity
-  x - NoDelay  = x
-  _ - Infinity = Infinity
+  NoDelay     - x          = x
+  Infinity    - _          = Infinity
+  x           - NoDelay    = x
+  _           - Infinity   = Infinity
   (Delay t1 ) - (Delay t2) = Delay (t1 - t2)
 
   _ * _ = error "trying to multiply two Delays"
-  abs NoDelay = NoDelay
-  abs Infinity = Infinity
+
+  abs NoDelay   = NoDelay
+  abs Infinity  = Infinity
   abs (Delay t) = Delay (abs t)
 
   signum (NoDelay) = 0
-  signum Infinity = 1
+  signum Infinity  = 1
   signum (Delay t) = Delay (signum t)
 
   fromInteger 0 = NoDelay
   fromInteger _ = error "trying to call fromInteger for a Delay. Cannot guess units"
-
-
-
 
